@@ -1,0 +1,244 @@
+pipeline:
+  projectIdentifier: migration
+  orgIdentifier: default
+  tags: {}
+  stages:
+    - stage:
+        name: process data
+        identifier: process_data
+        description: ""
+        type: CI
+        spec:
+          cloneCodebase: false
+          execution:
+            steps:
+              - parallel:
+                  - stepGroup:
+                      identifier: Download_Traces
+                      name: Download Traces
+                      steps:
+                        - step:
+                            identifier: Download_Traces
+                            type: Run
+                            name: Download Traces
+                            spec:
+                              connectorRef: account.harnessImage
+                              image: amazon/aws-cli
+                              shell: Sh
+                              command: |-
+                                mkdir -p traces
+
+                                aws s3 cp s3://$TRACE_BUCKET/ traces/archived/ --recursive
+                              envVariables:
+                                AWS_ACCESS_KEY_ID: AKIA2V2EZZUNIHFZNMDQ
+                                AWS_SECRET_ACCESS_KEY: <+secrets.getValue("ciplayawss3secret")>
+                              outputVariables:
+                                - name: version
+                                  type: String
+                                  value: version
+                        - step:
+                            identifier: untar
+                            type: Run
+                            name: untar
+                            spec:
+                              connectorRef: account.harnessImage
+                              image: ubuntu
+                              shell: Bash
+                              command: |-
+                                # Function to unzip all zip files in a folder
+                                folder_path="/harness/traces/archived"
+                                extract_folder="/harness/traces/extracted"
+                                mkdir -p "$extract_folder"
+
+                                # Loop through all zip files in the folder
+                                for zip_file in "$folder_path"/*.zip; do
+                                  # Check if there are any zip files
+                                  if [[ -e "$zip_file" ]]; then
+                                    # Create a directory for extraction (same name as the zip file, without the extension)
+                                    
+                                    # Unzip the file
+                                    echo "Extracting $zip_file to $extract_folder"
+                                    unzip -n -q "$zip_file" -d "$extract_folder" | true
+                                    rm -rf "$zip_file"
+                                  fi
+                                done
+                  - stepGroup:
+                      name: get binaries
+                      identifier: get_binaries
+                      steps:
+                        - step:
+                            type: Run
+                            name: download binaries
+                            identifier: doneload_binary
+                            spec:
+                              connectorRef: account.harnessImage
+                              image: ubuntu
+                              shell: Sh
+                              command: |-
+                                wget -O bin.zip https://elasticbeanstalk-us-east-1-734046833946.s3.us-east-1.amazonaws.com/bin.zip
+                                unzip -q -o bin.zip -d .
+                                chmod -R +x bin
+              - step:
+                  type: Run
+                  name: Run Migration
+                  identifier: Run_Migration
+                  spec:
+                    connectorRef: account.harnessImage
+                    image: openjdk:11
+                    shell: Bash
+                    command: |-
+                      export HOME="/root"
+                      cd bin
+
+                      archive_dir=/harness/traces/extracted
+
+                      script_dir=$(dirname "$0")
+                      base_out_dir="$archive_dir/files"
+                      merged_dir="$base_out_dir/4-merged"
+                      convert_dir="$base_out_dir/5-converted"
+
+                      mkdir -p "$merged_dir"
+                      mkdir -p "convert_dir"
+
+                      export _JAVA_OPTIONS="-Xms2g -Xmx12g"
+                      cli_jar="cli-wrapper-3.2.6-SNAPSHOT.jar"
+
+                      echo "Starting merge"
+                      java -jar "$cli_jar" -t "$archive_dir" -o merged.zip
+                      unzip -q -o merged.zip -d "$merged_dir"
+                      rm merged.zip
+
+                      # step 4: convert
+                      echo "Starting convert"
+                      mkdir -p "$convert_dir"
+                      ./go-convert jenkinsjson -downgrade -project "$PROJECT" -output-dir "$convert_dir" "$merged_dir"
+                      echo
+                      echo "Conversion Done"
+                      echo "Converted YAML files are stored here: $convert_dir"
+                      echo
+
+                      # publish result to a tar
+                      tar -czvf result.tar.gz "$base_out_dir"
+                contextType: Pipeline
+              - step:
+                  type: Run
+                  name: Upload Results
+                  identifier: Upload_Results
+                  spec:
+                    connectorRef: account.harnessImage
+                    image: amazon/aws-cli
+                    shell: Sh
+                    command: aws s3 cp bin/result.tar.gz s3://$RESULT_BUCKET/processed/
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: AKIA2V2EZZUNIHFZNMDQ
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("ciplayawss3secret")>
+                  when:
+                    stageStatus: Success
+                    condition: <+stage.variables.UPLOAD_RESULT>
+              - step:
+                  type: Run
+                  name: Post Pipeline
+                  identifier: Post_Pipeline
+                  spec:
+                    connectorRef: account.harnessImage
+                    image: python:3.8.20
+                    shell: Python
+                    command: |-
+                      import requests
+                      import os
+
+                      # URL of the API endpoint
+                      url = f"https://app.harness.io/pipeline/api/pipelines/v2?accountIdentifier={os.environ['ACCOUNT']}&orgIdentifier={os.environ['ORG']}&projectIdentifier={os.environ['PROJECT']}&storeType=INLINE&"
+
+                      # API Key for authentication
+                      api_key = os.environ['API_KEY']
+
+                      headers = {
+                          'Content-Type': 'application/yaml',
+                          'x-api-key': api_key
+                      }
+
+                      folder_path = "/harness/traces/extracted/files/5-converted"
+
+                      for filename in os.listdir(folder_path):
+                          file_path = os.path.join(folder_path, filename)
+                          
+                          # Only process files that end with .yaml or .yml
+                          if file_path.endswith(('.yaml', '.yml')):
+                              try:
+                                  with open(file_path, 'r') as file:
+                                      yaml_content = file.read()
+                                  
+                                  # Send the POST request with the YAML content as the body
+                                  response = requests.post(url, headers=headers, data=yaml_content)
+                                  
+                                  # Print the response status and content
+                                  print(f"Sent {filename} - Status Code: {response.status_code}")
+                                  if response.status_code != 200:
+                                      print(f"Error: {response.text}")
+                                  else:
+                                      print(f"Response for {filename}: {response.text[:100]}...")  # Print part of the response
+                                  
+                              except Exception as e:
+                                  print(f"Failed to process {filename}: {e}")
+                          else:
+                              print(f"Skipping non-YAML file: {filename}")
+                  when:
+                    stageStatus: Success
+                    condition: <+stage.variables.POST_PIPELINE>
+          caching:
+            enabled: false
+            paths: []
+          buildIntelligence:
+            enabled: false
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: aws_k8_new
+              namespace: aws_k8_new
+              automountServiceAccountToken: true
+              nodeSelector: {}
+              os: Linux
+        variables:
+          - name: TRACE_BUCKET
+            type: String
+            description: ""
+            required: false
+            value: <+input>
+          - name: RESULT_BUCKET
+            type: String
+            description: ""
+            required: false
+            value: <+input>
+          - name: UPLOAD_RESULT
+            type: String
+            description: ""
+            required: false
+            value: <+input>.selectOneFrom("true","false")
+          - name: POST_PIPELINE
+            type: String
+            description: ""
+            required: false
+            value: <+input>.selectOneFrom("true","false")
+          - name: PROJECT
+            type: String
+            description: ""
+            required: true
+            value: <+input>
+          - name: ORG
+            type: String
+            description: ""
+            required: true
+            value: <+input>
+          - name: ACCOUNT
+            type: String
+            description: ""
+            required: false
+            value: <+input>
+          - name: API_KEY
+            type: Secret
+            description: ""
+            required: false
+            value: jamie_api_key_harness
+  identifier: Customer_Jenkins_Data_Processing
+  name: Customer Jenkins Data Processing
